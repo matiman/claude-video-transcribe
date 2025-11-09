@@ -259,7 +259,7 @@ impl VideoTranscriber {
 
         // Step 3: Get the dataset items
         let dataset_url = format!(
-            "https://api.apify.com/v2/acts/streamers~youtube-scraper/runs/{}/dataset/items?token={}",
+            "https://api.apify.com/v2/actor-runs/{}/dataset/items?token={}",
             run_id, self.apify_api_key
         );
 
@@ -294,39 +294,65 @@ impl VideoTranscriber {
         Ok(transcript.clone())
     }
 
-    /// Upload transcript to Gemini File API
+    /// Upload transcript to Gemini File API using resumable upload
     fn upload_to_gemini(&self, transcript: &str, video_url: &str) -> Result<String> {
         println!("☁️  Uploading transcript to Gemini File API...");
 
-        // Create a temporary file name based on the video URL
         let video_id = self.extract_video_id(video_url)?;
         let file_name = format!("youtube_transcript_{}.txt", video_id);
+        let transcript_bytes = transcript.as_bytes();
+        let num_bytes = transcript_bytes.len();
 
-        // Upload file using multipart/form-data
-        let upload_url = format!(
+        // Step 1: Start the resumable upload
+        let init_url = format!(
             "https://generativelanguage.googleapis.com/upload/v1beta/files?key={}",
             self.gemini_api_key
         );
 
-        // First, create a metadata request
         let metadata = serde_json::json!({
             "file": {
                 "display_name": file_name,
             }
         });
 
-        // Use multipart upload
-        let form = reqwest::blocking::multipart::Form::new()
-            .text("metadata", metadata.to_string())
-            .text("file", transcript.to_string());
+        let init_response = self
+            .client
+            .post(&init_url)
+            .header("X-Goog-Upload-Protocol", "resumable")
+            .header("X-Goog-Upload-Command", "start")
+            .header("X-Goog-Upload-Header-Content-Length", num_bytes.to_string())
+            .header("X-Goog-Upload-Header-Content-Type", "text/plain")
+            .header("Content-Type", "application/json")
+            .json(&metadata)
+            .send()
+            .context("Failed to initiate file upload to Gemini")?;
 
+        if !init_response.status().is_success() {
+            let status = init_response.status();
+            let body = init_response.text().unwrap_or_default();
+            anyhow::bail!("Gemini upload init failed with status {}: {}", status, body);
+        }
+
+        // Get the upload URL from the response header
+        let upload_url = init_response
+            .headers()
+            .get("x-goog-upload-url")
+            .context("No upload URL in response headers")?
+            .to_str()
+            .context("Invalid upload URL header")?;
+
+        println!("   Upload session created, sending file data...");
+
+        // Step 2: Upload the actual file bytes
         let upload_response = self
             .client
-            .post(&upload_url)
-            .header("X-Goog-Upload-Protocol", "multipart")
-            .multipart(form)
+            .post(upload_url)
+            .header("Content-Length", num_bytes.to_string())
+            .header("X-Goog-Upload-Offset", "0")
+            .header("X-Goog-Upload-Command", "upload, finalize")
+            .body(transcript_bytes.to_vec())
             .send()
-            .context("Failed to upload file to Gemini")?;
+            .context("Failed to upload file bytes to Gemini")?;
 
         if !upload_response.status().is_success() {
             let status = upload_response.status();
@@ -449,8 +475,7 @@ impl VideoTranscriber {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let transcriber = VideoTranscriber::new()?;
 
