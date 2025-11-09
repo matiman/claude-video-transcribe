@@ -669,9 +669,8 @@ fn main() -> Result<()> {
         }
         Commands::Ask { url, question } => {
             println!("🚀 Processing question for video: {}", url);
-            println!("⚠️  Note: This will re-index the video. Use 'index' first for better performance.");
-            let file_uri = transcriber.index_video(&url)?;
-            let answer = transcriber.ask_question(&file_uri, &question)?;
+            let transcript = transcriber.fetch_transcript(&url)?;
+            let answer = transcriber.ask_question_direct(&transcript, &question)?;
             println!("\n💡 Answer:\n{}", answer);
         }
         Commands::Query { url, question } => {
