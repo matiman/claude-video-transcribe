@@ -146,11 +146,51 @@ struct GeminiResponsePart {
     text: Option<String>,
 }
 
+// ===== Groq API Structures =====
+
+#[derive(Serialize)]
+struct GroqRequest {
+    model: String,
+    messages: Vec<GroqMessage>,
+    temperature: f32,
+}
+
+#[derive(Serialize)]
+struct GroqMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct GroqResponse {
+    choices: Vec<GroqChoice>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GroqChoice {
+    message: GroqResponseMessage,
+}
+
+#[derive(Deserialize, Debug)]
+struct GroqResponseMessage {
+    content: String,
+}
+
+// ===== Provider Selection =====
+
+#[derive(Debug, Clone)]
+enum LlmProvider {
+    Groq,
+    Gemini,
+}
+
 // ===== Main Application Logic =====
 
 struct VideoTranscriber {
     apify_api_key: String,
     gemini_api_key: String,
+    groq_api_key: String,
+    llm_provider: LlmProvider,
     client: reqwest::blocking::Client,
 }
 
@@ -160,16 +200,43 @@ impl VideoTranscriber {
 
         let apify_api_key = env::var("APIFY_API_KEY")
             .context("APIFY_API_KEY environment variable not set")?;
-        let gemini_api_key = env::var("GEMINI_API_KEY")
-            .context("GEMINI_API_KEY environment variable not set")?;
+
+        let gemini_api_key = env::var("GEMINI_API_KEY").unwrap_or_default();
+        let groq_api_key = env::var("GROQ_API_KEY").unwrap_or_default();
+
+        // Determine which provider to use
+        let provider_str = env::var("LLM_PROVIDER").unwrap_or_else(|_| "groq".to_string());
+        let llm_provider = match provider_str.to_lowercase().as_str() {
+            "gemini" => LlmProvider::Gemini,
+            "groq" => LlmProvider::Groq,
+            _ => {
+                println!("⚠️  Unknown LLM_PROVIDER '{}', defaulting to Groq", provider_str);
+                LlmProvider::Groq
+            }
+        };
+
+        // Validate that the selected provider has an API key
+        match llm_provider {
+            LlmProvider::Gemini if gemini_api_key.is_empty() => {
+                anyhow::bail!("GEMINI_API_KEY is required when LLM_PROVIDER=gemini");
+            }
+            LlmProvider::Groq if groq_api_key.is_empty() => {
+                anyhow::bail!("GROQ_API_KEY is required when LLM_PROVIDER=groq");
+            }
+            _ => {}
+        }
 
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?;
 
+        println!("🤖 Using LLM provider: {:?}", llm_provider);
+
         Ok(Self {
             apify_api_key,
             gemini_api_key,
+            groq_api_key,
+            llm_provider,
             client,
         })
     }
@@ -460,9 +527,61 @@ impl VideoTranscriber {
         anyhow::bail!("Could not extract video ID from URL: {}", url);
     }
 
-    /// Ask a question with transcript directly (no file upload needed)
-    fn ask_question_direct(&self, transcript: &str, question: &str) -> Result<String> {
-        println!("🤔 Asking question: \"{}\"", question);
+    /// Ask a question with transcript directly using Groq
+    fn ask_question_groq(&self, transcript: &str, question: &str) -> Result<String> {
+        println!("🤔 Asking question with Groq: \"{}\"", question);
+
+        let prompt = format!(
+            "Based on the following YouTube video transcript, please answer this question: {}\n\nTranscript:\n{}",
+            question, transcript
+        );
+
+        let request = GroqRequest {
+            model: "llama-3.3-70b-versatile".to_string(), // Fast and capable model
+            messages: vec![
+                GroqMessage {
+                    role: "system".to_string(),
+                    content: "You are a helpful assistant that answers questions about YouTube video transcripts accurately and concisely.".to_string(),
+                },
+                GroqMessage {
+                    role: "user".to_string(),
+                    content: prompt,
+                },
+            ],
+            temperature: 0.3,
+        };
+
+        let response = self
+            .client
+            .post("https://api.groq.com/openai/v1/chat/completions")
+            .header("Authorization", format!("Bearer {}", self.groq_api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .context("Failed to generate answer from Groq")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            anyhow::bail!("Groq generate failed with status {}: {}", status, body);
+        }
+
+        let groq_response: GroqResponse = response
+            .json()
+            .context("Failed to parse Groq response")?;
+
+        let answer = groq_response
+            .choices
+            .first()
+            .map(|choice| choice.message.content.clone())
+            .context("No answer generated by Groq")?;
+
+        Ok(answer)
+    }
+
+    /// Ask a question with transcript directly using Gemini
+    fn ask_question_gemini(&self, transcript: &str, question: &str) -> Result<String> {
+        println!("🤔 Asking question with Gemini: \"{}\"", question);
 
         let generate_url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}",
@@ -510,6 +629,14 @@ impl VideoTranscriber {
             .context("No answer generated by Gemini")?;
 
         Ok(answer)
+    }
+
+    /// Ask a question with transcript directly (no file upload needed)
+    fn ask_question_direct(&self, transcript: &str, question: &str) -> Result<String> {
+        match self.llm_provider {
+            LlmProvider::Groq => self.ask_question_groq(transcript, question),
+            LlmProvider::Gemini => self.ask_question_gemini(transcript, question),
+        }
     }
 
     /// Index a video (fetch transcript and upload to Gemini)
